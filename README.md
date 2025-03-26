@@ -29,6 +29,9 @@ PGUSER=...
 PGPASSWORD=...
 ```
 
+Note: the CLI disables SSL in the Postgres connection settings to match the
+production server configuration.
+
 ## Usage
 Initialize the schema and tables:
 
