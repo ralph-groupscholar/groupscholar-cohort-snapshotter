@@ -59,6 +59,25 @@ dart run bin/groupscholar_cohort_snapshotter.dart report \\
   --out reports/cohort_snapshot_report.csv
 ```
 
+Generate an aggregated summary report:
+
+```bash
+dart run bin/groupscholar_cohort_snapshotter.dart summary \\
+  --schema cohort_snapshotter \\
+  --date 2026-02-08 \\
+  --stale-days 14 \\
+  --out reports/cohort_summary_report.csv
+```
+
+Stream the summary report to stdout:
+
+```bash
+dart run bin/groupscholar_cohort_snapshotter.dart summary \\
+  --schema cohort_snapshotter \\
+  --date 2026-02-08 \\
+  --out -
+```
+
 ## Testing
 ```bash
 dart test

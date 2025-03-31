@@ -60,11 +60,31 @@ String formatDate(DateTime date) => _formatDate(date);
 
 DateTime parseDate(String value) => _parseDate(value);
 
+String formatPercent({required int numerator, required int denominator}) {
+  if (denominator == 0) {
+    return '0.0';
+  }
+  final value = (numerator / denominator) * 100;
+  return value.toStringAsFixed(1);
+}
+
 class ReportOptions {
   ReportOptions({required this.snapshotDate, required this.outputPath});
 
   final DateTime snapshotDate;
   final String outputPath;
+}
+
+class SummaryOptions {
+  SummaryOptions({
+    required this.snapshotDate,
+    required this.outputPath,
+    required this.staleDays,
+  });
+
+  final DateTime snapshotDate;
+  final String outputPath;
+  final int staleDays;
 }
 
 class CohortRecord {
@@ -131,6 +151,15 @@ Future<void> run(List<String> arguments) async {
       return;
     }
 
+    if (results.command?.name == 'summary') {
+      final opts = _summaryOptions(results.command!);
+      await _generateSummaryReport(config, opts);
+      if (opts.outputPath != '-') {
+        stdout.writeln('Summary report written to ${opts.outputPath}.');
+      }
+      return;
+    }
+
     stdout.writeln(parser.usage);
   } catch (error) {
     stderr.writeln('Error: $error');
@@ -167,11 +196,7 @@ ArgParser _buildParser() {
       defaultsTo: 'Foundations',
       help: 'Program or cohort name.',
     )
-    ..addOption(
-      'notes',
-      defaultsTo: '',
-      help: 'Optional snapshot notes.',
-    );
+    ..addOption('notes', defaultsTo: '', help: 'Optional snapshot notes.');
 
   final report = parser.addCommand('report');
   report
@@ -184,6 +209,24 @@ ArgParser _buildParser() {
       'out',
       defaultsTo: p.join('reports', 'cohort_snapshot_report.csv'),
       help: 'Output CSV path.',
+    );
+
+  final summary = parser.addCommand('summary');
+  summary
+    ..addOption(
+      'date',
+      defaultsTo: _formatDate(DateTime.now()),
+      help: 'Snapshot date (YYYY-MM-DD).',
+    )
+    ..addOption(
+      'out',
+      defaultsTo: p.join('reports', 'cohort_summary_report.csv'),
+      help: 'Output CSV path, or - for stdout.',
+    )
+    ..addOption(
+      'stale-days',
+      defaultsTo: '14',
+      help: 'Days since last touchpoint to count as stale.',
     );
 
   return parser;
@@ -204,6 +247,16 @@ ReportOptions _reportOptions(ArgResults results) {
   return ReportOptions(
     snapshotDate: date,
     outputPath: results['out'] as String,
+  );
+}
+
+SummaryOptions _summaryOptions(ArgResults results) {
+  final date = _parseDate(results['date'] as String);
+  final staleDays = int.tryParse(results['stale-days'] as String) ?? 14;
+  return SummaryOptions(
+    snapshotDate: date,
+    outputPath: results['out'] as String,
+    staleDays: staleDays,
   );
 }
 
@@ -307,7 +360,8 @@ Future<void> _generateReport(AppConfig config, ReportOptions options) async {
   final conn = await _openConnection(config);
   try {
     await conn.execute('SET search_path TO ${config.schema};');
-    final rows = await conn.execute(Sql.named('''
+    final rows = await conn.execute(
+      Sql.named('''
 SELECT s.snapshot_date,
        s.program,
        s.source,
@@ -322,7 +376,9 @@ SELECT s.snapshot_date,
 FROM cohort_snapshots s
 JOIN cohort_members m ON s.id = m.snapshot_id
 WHERE s.snapshot_date = @date
-ORDER BY s.program, m.full_name;'''), parameters: {'date': options.snapshotDate});
+ORDER BY s.program, m.full_name;'''),
+      parameters: {'date': options.snapshotDate},
+    );
 
     final data = <List<dynamic>>[
       [
@@ -337,7 +393,7 @@ ORDER BY s.program, m.full_name;'''), parameters: {'date': options.snapshotDate}
         'last_touchpoint',
         'risk_level',
         'engagement_score',
-      ]
+      ],
     ];
 
     for (final row in rows) {
@@ -357,6 +413,97 @@ ORDER BY s.program, m.full_name;'''), parameters: {'date': options.snapshotDate}
     }
 
     final csv = const ListToCsvConverter().convert(data);
+    final file = File(options.outputPath);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(csv);
+  } finally {
+    await conn.close();
+  }
+}
+
+Future<void> _generateSummaryReport(
+  AppConfig config,
+  SummaryOptions options,
+) async {
+  final conn = await _openConnection(config);
+  try {
+    await conn.execute('SET search_path TO ${config.schema};');
+    final staleDate = options.snapshotDate.subtract(
+      Duration(days: options.staleDays),
+    );
+    final rows = await conn.execute(
+      Sql.named('''
+SELECT s.snapshot_date,
+       s.program,
+       COUNT(*) AS total_members,
+       SUM(CASE WHEN m.status = 'Active' THEN 1 ELSE 0 END) AS active_members,
+       SUM(
+         CASE WHEN m.touchpoint_status = 'Needs Follow-Up'
+         THEN 1 ELSE 0 END
+       ) AS needs_followup_members,
+       SUM(CASE WHEN m.risk_level = 'High' THEN 1 ELSE 0 END) AS high_risk,
+       SUM(CASE WHEN m.risk_level = 'Medium' THEN 1 ELSE 0 END) AS medium_risk,
+       SUM(CASE WHEN m.risk_level = 'Low' THEN 1 ELSE 0 END) AS low_risk,
+       AVG(m.engagement_score) AS avg_engagement,
+       SUM(
+         CASE
+           WHEN m.last_touchpoint IS NULL THEN 1
+           WHEN m.last_touchpoint <= @staleDate THEN 1
+           ELSE 0
+         END
+       ) AS stale_touchpoints
+FROM cohort_snapshots s
+JOIN cohort_members m ON s.id = m.snapshot_id
+WHERE s.snapshot_date = @date
+GROUP BY s.snapshot_date, s.program
+ORDER BY s.program;
+'''),
+      parameters: {'date': options.snapshotDate, 'staleDate': staleDate},
+    );
+
+    final data = <List<dynamic>>[
+      [
+        'snapshot_date',
+        'program',
+        'total_members',
+        'active_members',
+        'needs_followup_members',
+        'high_risk_members',
+        'medium_risk_members',
+        'low_risk_members',
+        'avg_engagement_score',
+        'stale_touchpoints',
+        'pct_needs_followup',
+        'pct_high_risk',
+      ],
+    ];
+
+    for (final row in rows) {
+      final total = (row[2] as int?) ?? 0;
+      final needsFollowUp = (row[4] as int?) ?? 0;
+      final highRisk = (row[5] as int?) ?? 0;
+      final avgEngagement = row[8] as double?;
+      data.add([
+        _formatDate(row[0] as DateTime),
+        row[1],
+        total,
+        row[3],
+        needsFollowUp,
+        highRisk,
+        row[6],
+        row[7],
+        avgEngagement == null ? '' : avgEngagement.toStringAsFixed(1),
+        row[9],
+        formatPercent(numerator: needsFollowUp, denominator: total),
+        formatPercent(numerator: highRisk, denominator: total),
+      ]);
+    }
+
+    final csv = const ListToCsvConverter().convert(data);
+    if (options.outputPath == '-') {
+      stdout.write(csv);
+      return;
+    }
     final file = File(options.outputPath);
     await file.parent.create(recursive: true);
     await file.writeAsString(csv);

@@ -13,4 +13,12 @@ void main() {
     expect(date.month, 1);
     expect(date.day, 15);
   });
+
+  test('formatPercent returns one decimal', () {
+    expect(formatPercent(numerator: 1, denominator: 4), '25.0');
+  });
+
+  test('formatPercent handles zero denominator', () {
+    expect(formatPercent(numerator: 3, denominator: 0), '0.0');
+  });
 }
