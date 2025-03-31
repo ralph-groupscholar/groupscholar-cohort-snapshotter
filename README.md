@@ -78,6 +78,16 @@ dart run bin/groupscholar_cohort_snapshotter.dart summary \\
   --out -
 ```
 
+Generate a leadership brief (writes markdown and stores summary metrics):
+
+```bash
+dart run bin/groupscholar_cohort_snapshotter.dart brief \\
+  --schema cohort_snapshotter \\
+  --date 2026-02-08 \\
+  --stale-days 14 \\
+  --out reports/cohort_snapshot_brief.md
+```
+
 ## Testing
 ```bash
 dart test

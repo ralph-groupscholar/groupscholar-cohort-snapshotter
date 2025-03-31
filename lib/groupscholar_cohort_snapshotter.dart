@@ -87,6 +87,18 @@ class SummaryOptions {
   final int staleDays;
 }
 
+class BriefOptions {
+  BriefOptions({
+    required this.snapshotDate,
+    required this.outputPath,
+    required this.staleDays,
+  });
+
+  final DateTime snapshotDate;
+  final String outputPath;
+  final int staleDays;
+}
+
 class CohortRecord {
   CohortRecord({
     required this.scholarId,
@@ -160,6 +172,13 @@ Future<void> run(List<String> arguments) async {
       return;
     }
 
+    if (results.command?.name == 'brief') {
+      final opts = _briefOptions(results.command!);
+      await _generateBrief(config, opts);
+      stdout.writeln('Brief written to ${opts.outputPath}.');
+      return;
+    }
+
     stdout.writeln(parser.usage);
   } catch (error) {
     stderr.writeln('Error: $error');
@@ -229,6 +248,24 @@ ArgParser _buildParser() {
       help: 'Days since last touchpoint to count as stale.',
     );
 
+  final brief = parser.addCommand('brief');
+  brief
+    ..addOption(
+      'date',
+      defaultsTo: _formatDate(DateTime.now()),
+      help: 'Snapshot date (YYYY-MM-DD).',
+    )
+    ..addOption(
+      'out',
+      defaultsTo: p.join('reports', 'cohort_snapshot_brief.md'),
+      help: 'Output markdown brief path.',
+    )
+    ..addOption(
+      'stale-days',
+      defaultsTo: '14',
+      help: 'Days since last touchpoint to count as stale.',
+    );
+
   return parser;
 }
 
@@ -254,6 +291,16 @@ SummaryOptions _summaryOptions(ArgResults results) {
   final date = _parseDate(results['date'] as String);
   final staleDays = int.tryParse(results['stale-days'] as String) ?? 14;
   return SummaryOptions(
+    snapshotDate: date,
+    outputPath: results['out'] as String,
+    staleDays: staleDays,
+  );
+}
+
+BriefOptions _briefOptions(ArgResults results) {
+  final date = _parseDate(results['date'] as String);
+  final staleDays = int.tryParse(results['stale-days'] as String) ?? 14;
+  return BriefOptions(
     snapshotDate: date,
     outputPath: results['out'] as String,
     staleDays: staleDays,
@@ -288,8 +335,29 @@ CREATE TABLE IF NOT EXISTS cohort_members (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );''');
     await conn.execute('''
+CREATE TABLE IF NOT EXISTS cohort_snapshot_metrics (
+  id SERIAL PRIMARY KEY,
+  snapshot_id INTEGER NOT NULL REFERENCES cohort_snapshots(id) ON DELETE CASCADE,
+  snapshot_date DATE NOT NULL,
+  program TEXT NOT NULL,
+  source TEXT NOT NULL,
+  stale_days INTEGER NOT NULL,
+  total_members INTEGER NOT NULL,
+  active_members INTEGER NOT NULL,
+  high_risk INTEGER NOT NULL,
+  medium_risk INTEGER NOT NULL,
+  low_risk INTEGER NOT NULL,
+  avg_engagement NUMERIC(5, 2) NOT NULL,
+  stale_touchpoints INTEGER NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (snapshot_id, stale_days)
+);''');
+    await conn.execute('''
 CREATE INDEX IF NOT EXISTS idx_cohort_members_snapshot
   ON cohort_members(snapshot_id);''');
+    await conn.execute('''
+CREATE INDEX IF NOT EXISTS idx_snapshot_metrics_snapshot
+  ON cohort_snapshot_metrics(snapshot_id);''');
   } finally {
     await conn.close();
   }
@@ -512,6 +580,158 @@ ORDER BY s.program;
   }
 }
 
+Future<void> _generateBrief(AppConfig config, BriefOptions options) async {
+  final conn = await _openConnection(config);
+  try {
+    await conn.execute('SET search_path TO ${config.schema};');
+    final snapshots = await conn.execute(
+      Sql.named('''
+SELECT id, snapshot_date, program, source
+FROM cohort_snapshots
+WHERE snapshot_date = @date
+ORDER BY program;'''),
+      parameters: {'date': options.snapshotDate},
+    );
+
+    if (snapshots.isEmpty) {
+      throw StateError(
+        'No cohort snapshots found for ${_formatDate(options.snapshotDate)}.',
+      );
+    }
+
+    final staleCutoff =
+        computeStaleCutoff(options.snapshotDate, options.staleDays);
+    final lines = <String>[
+      '# Cohort Snapshot Brief',
+      '',
+      'Date: ${_formatDate(options.snapshotDate)}',
+      'Stale touchpoints threshold: ${options.staleDays} days '
+          '(on or before ${_formatDate(staleCutoff)})',
+      '',
+    ];
+
+    for (final snapshot in snapshots) {
+      final snapshotId = snapshot[0] as int;
+      final program = snapshot[2] as String;
+      final source = snapshot[3] as String;
+      final stats = await conn.execute(
+        Sql.named('''
+SELECT
+  COUNT(*) AS total_members,
+  SUM(CASE WHEN status = 'Active' THEN 1 ELSE 0 END) AS active_members,
+  SUM(CASE WHEN risk_level = 'High' THEN 1 ELSE 0 END) AS high_risk,
+  SUM(CASE WHEN risk_level = 'Medium' THEN 1 ELSE 0 END) AS medium_risk,
+  SUM(CASE WHEN risk_level = 'Low' THEN 1 ELSE 0 END) AS low_risk,
+  AVG(engagement_score) AS avg_engagement,
+  SUM(
+    CASE
+      WHEN last_touchpoint IS NULL THEN 1
+      WHEN last_touchpoint <= @staleCutoff THEN 1
+      ELSE 0
+    END
+  ) AS stale_touchpoints
+FROM cohort_members
+WHERE snapshot_id = @snapshotId;'''),
+        parameters: {
+          'snapshotId': snapshotId,
+          'staleCutoff': staleCutoff,
+        },
+      );
+
+      final row = stats.first;
+      final total = (row[0] as int?) ?? 0;
+      final active = (row[1] as int?) ?? 0;
+      final highRisk = (row[2] as int?) ?? 0;
+      final mediumRisk = (row[3] as int?) ?? 0;
+      final lowRisk = (row[4] as int?) ?? 0;
+      final avgEngagement = ((row[5] as num?) ?? 0).toDouble();
+      final staleTouchpoints = (row[6] as int?) ?? 0;
+      final atRisk = highRisk + mediumRisk;
+
+      await conn.execute(
+        Sql.named('''
+INSERT INTO cohort_snapshot_metrics (
+  snapshot_id,
+  snapshot_date,
+  program,
+  source,
+  stale_days,
+  total_members,
+  active_members,
+  high_risk,
+  medium_risk,
+  low_risk,
+  avg_engagement,
+  stale_touchpoints
+)
+VALUES (
+  @snapshotId,
+  @snapshotDate,
+  @program,
+  @source,
+  @staleDays,
+  @totalMembers,
+  @activeMembers,
+  @highRisk,
+  @mediumRisk,
+  @lowRisk,
+  @avgEngagement,
+  @staleTouchpoints
+)
+ON CONFLICT (snapshot_id, stale_days) DO UPDATE SET
+  total_members = EXCLUDED.total_members,
+  active_members = EXCLUDED.active_members,
+  high_risk = EXCLUDED.high_risk,
+  medium_risk = EXCLUDED.medium_risk,
+  low_risk = EXCLUDED.low_risk,
+  avg_engagement = EXCLUDED.avg_engagement,
+  stale_touchpoints = EXCLUDED.stale_touchpoints,
+  created_at = NOW();'''),
+        parameters: {
+          'snapshotId': snapshotId,
+          'snapshotDate': options.snapshotDate,
+          'program': program,
+          'source': source,
+          'staleDays': options.staleDays,
+          'totalMembers': total,
+          'activeMembers': active,
+          'highRisk': highRisk,
+          'mediumRisk': mediumRisk,
+          'lowRisk': lowRisk,
+          'avgEngagement': avgEngagement,
+          'staleTouchpoints': staleTouchpoints,
+        },
+      );
+
+      lines
+        ..add('## $program (source: $source)')
+        ..add('- Total members: $total')
+        ..add('- Active members: $active')
+        ..add(
+          '- At-risk members: $atRisk '
+          '(${formatPercent(numerator: atRisk, denominator: total)}%)',
+        )
+        ..add(
+          '- Risk levels: High $highRisk | Medium $mediumRisk | Low $lowRisk',
+        )
+        ..add(
+          '- Avg engagement score: ${avgEngagement.toStringAsFixed(1)}',
+        )
+        ..add(
+          '- Stale touchpoints: $staleTouchpoints '
+          '(on or before ${_formatDate(staleCutoff)})',
+        )
+        ..add('');
+    }
+
+    final file = File(options.outputPath);
+    await file.parent.create(recursive: true);
+    await file.writeAsString(lines.join('\n'));
+  } finally {
+    await conn.close();
+  }
+}
+
 Future<Connection> _openConnection(AppConfig config) async {
   final endpoint = Endpoint(
     host: config.dbHost,
@@ -674,4 +894,8 @@ String _formatDate(DateTime date) {
   final month = date.month.toString().padLeft(2, '0');
   final day = date.day.toString().padLeft(2, '0');
   return '${date.year}-$month-$day';
+}
+
+DateTime computeStaleCutoff(DateTime snapshotDate, int staleDays) {
+  return snapshotDate.subtract(Duration(days: staleDays));
 }

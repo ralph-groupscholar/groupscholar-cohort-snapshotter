@@ -21,4 +21,12 @@ void main() {
   test('formatPercent handles zero denominator', () {
     expect(formatPercent(numerator: 3, denominator: 0), '0.0');
   });
+
+  test('computeStaleCutoff subtracts stale days', () {
+    final date = DateTime(2026, 2, 8);
+    final cutoff = computeStaleCutoff(date, 14);
+    expect(cutoff.year, 2026);
+    expect(cutoff.month, 1);
+    expect(cutoff.day, 25);
+  });
 }
